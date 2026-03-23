@@ -1,0 +1,28 @@
+
+### Vagrant ###
+# General
+.vagrant/
+
+# Log files (if you are creating logs in debug mode, uncomment this)
+# *.log
+
+### Vagrant Patch ###
+Vagrantfile
+*.box
+
+demo.sh
+
+# AWS credentials — never commit
+.env
+*.env
+
+# Runtime data
+*.lock
+*.log
+
+# Local backups
+backups/
+.cloudtask/
+
+# macOS
+.DS_Store
