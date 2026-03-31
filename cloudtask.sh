@@ -1,9 +1,9 @@
 #!/bin/bash
 # =============================================================================
-#  CloudTask Pro — AWS-Integrated Terminal Task Manager
+#  CloudTask — AWS-Integrated Terminal Task Manager
 #  Version: 1.0.0
 #  Author:  Oyekanmi Lekan
-#  GitHub:  github.com/intellisensecodez/cloudtask-pro
+#  GitHub:  github.com/intellisensecodez/cloudtask
 #
 #  Description:
 #    A production-grade, terminal-based task management system for developers
@@ -19,7 +19,7 @@
 #  Prerequisites:
 #    - Bash >= 4.0
 #    - AWS CLI v2 configured (aws configure)
-#    - IAM permissions: s3:*, sns:Publish, logs:*
+#    - IAM permissions: s3:*, sns:Publish, logs:* etc
 #
 #  Usage:
 #    chmod +x cloudtask.sh
@@ -29,15 +29,15 @@
 #    ./cloudtask.sh list       # Print all tasks and exit
 # =============================================================================
 
-
 set -euo pipefail   # Exit on error, unset variable, or pipe failure
 IFS=$'\n\t'         # Safer word splitting
+
 
 # =============================================================================
 #  CONFIGURATION
 # =============================================================================
 
-readonly APP_NAME="CloudTask Pro"
+readonly APP_NAME="CloudTask"
 readonly APP_VERSION="1.0.0"
 
 # Local storage
@@ -48,11 +48,12 @@ readonly BACKUP_DIR="${DATA_DIR}/backups"
 readonly LOCK_FILE="${DATA_DIR}/cloudtask.lock"
 
 # AWS configuration 
-AWS_REGION="${AWS_REGION:-ue-west-1}"
-S3_BUCKET="${S3_BUCKET:-}"                   # e.g. my-company-cloudtask-backup
-SNS_TOPIC_ARN="${SNS_TOPIC_ARN:-}"           # e.g. arn:aws:sns:us-east-1:123456789:cloudtask-alerts
-CW_LOG_GROUP="${CW_LOG_GROUP:-/cloudtask/prod}"
-CW_LOG_STREAM="${CW_LOG_STREAM:-$(hostname)}"
+readonly AWS_REGION="${AWS_REGION}"
+readonly S3_BUCKET="${S3_BUCKET}"                   
+readonly SNS_TOPIC_ARN="${SNS_TOPIC_ARN}"        
+readonly CW_LOG_GROUP="${CW_LOG_GROUP}"
+readonly CW_LOG_STREAM="${CW_LOG_STREAM:-$(date +"%Y-%m-%d")}" # Set a default log stream name based on current date
+
 
 # CSV columns 
 readonly CSV_HEADER="ID,Name,Description,Category,Priority,DueDate,Status,CreatedAt,UpdatedAt,CompletedAt"
@@ -84,8 +85,8 @@ readonly RESET=$'\033[0m'
 #  OUTPUT HELPERS
 # =============================================================================
 
-print_line() { echo -e "${DIM}$(printf '─%.0s' {1..100})${RESET}"; }
-print_dline() { echo -e "${BOLD_BLUE}$(printf '═%.0s' {1..100})${RESET}"; }
+print_line() { echo -e "${DIM}$(printf '─%.0s' {1..120})${RESET}"; }
+print_dline() { echo -e "${BOLD_BLUE}$(printf '═%.0s' {1..120})${RESET}"; }
 blank() { echo ""; }
 
 success() { echo -e "${BOLD_GREEN}  ✔  $*${RESET}"; }
@@ -116,7 +117,7 @@ print_help() {
 cat <<EOF
 
 ${BOLD_CYAN}${APP_NAME} v${APP_VERSION}${RESET}
-AWS-Integrated Terminal Task Manager
+An AWS-Integrated Terminal Task Manager
 
 ${BOLD_WHITE}USAGE:${RESET}
 ./cloudtask.sh              Launch interactive menu
@@ -125,7 +126,7 @@ ${BOLD_WHITE}USAGE:${RESET}
 ./cloudtask.sh --help       Show this help message
 
 ${BOLD_WHITE}AWS ENVIRONMENT VARIABLES:${RESET}
-AWS_REGION          AWS region (default: us-east-1)
+AWS_REGION          AWS region (default: us-west-1)
 S3_BUCKET           S3 bucket name for backups
 SNS_TOPIC_ARN       SNS topic ARN for HIGH priority alerts
 CW_LOG_GROUP        CloudWatch log group name
@@ -158,6 +159,39 @@ log() {
 
   # Write to local log
   echo "${entry}" >> "${LOG_FILE}"
+
+  # Ship to CloudWatch if configured
+  if [[ -n "${CW_LOG_GROUP}" ]] && command -v aws &>/dev/null; then
+    ship_to_cloudwatch "${entry}" &   # Non-blocking background job
+  fi
+}
+
+ship_to_cloudwatch() {
+  local message="$1"
+  local ts=$(date +%s%3N)
+
+  # Check if log stream exists
+  if ! aws logs describe-log-streams \
+    --log-group-name "${CW_LOG_GROUP}" \
+    --log-stream-name-prefix "${CW_LOG_STREAM}" \
+    --region "${AWS_REGION}" \
+    --query "logStreams[?logStreamName=='${CW_LOG_STREAM}']" \
+    --output text | grep -q "${CW_LOG_STREAM}"; then
+    
+    echo "Creating log stream: ${CW_LOG_STREAM}"
+    aws logs create-log-stream \
+        --log-group-name "${CW_LOG_GROUP}" \
+        --log-stream-name "${CW_LOG_STREAM}" \
+        --region "${AWS_REGION}"
+  fi
+
+  # CloudWatch shipping 
+  aws logs put-log-events \
+    --log-group-name  "${CW_LOG_GROUP}" \
+    --log-stream-name "${CW_LOG_STREAM}" \
+    --log-events "[{\"timestamp\":$ts,\"message\":\"$message\"}]" \
+    --region "${AWS_REGION}" \
+    --no-cli-pager >/dev/null || true
 }
 
 
@@ -270,6 +304,100 @@ release_lock() {
 # Always release lock on exit (normal or error)
 trap release_lock EXIT
 
+
+# =============================================================================
+#  AWS HELPERS
+# =============================================================================
+
+aws_available() {
+  command -v aws &>/dev/null && [[ -n "${S3_BUCKET}" ]]
+}
+
+sns_available() {
+  command -v aws &>/dev/null && [[ -n "${SNS_TOPIC_ARN}" ]]
+}
+
+# Upload tasks.csv to S3
+s3_backup() {
+  if aws_available; then
+    local timestamp
+    timestamp=$(date '+%Y%m%d_%H%M%S')
+    local s3_key="backups/tasks_${timestamp}.csv"
+
+    info "Backing up to s3://${S3_BUCKET}/${s3_key} ..."
+
+    if aws s3 cp "${TASKS_FILE}" "s3://${S3_BUCKET}/${s3_key}" \
+        --region "${AWS_REGION}" \
+        --no-cli-pager 2>/dev/null; then
+      success "Backup uploaded to S3"
+      log "INFO" "S3 backup successful: s3://${S3_BUCKET}/${s3_key}"
+    else
+      warn "S3 backup failed — tasks saved locally only"
+      log "WARN" "S3 backup failed"
+    fi
+  else
+    # Save a local backup instead
+    local ts; ts=$(date '+%Y%m%d_%H%M%S')
+    cp "${TASKS_FILE}" "${BACKUP_DIR}/tasks_${ts}.csv"
+    success "Local backup saved to ${BACKUP_DIR}/tasks_${ts}.csv"
+    log "INFO" "Local backup saved: ${BACKUP_DIR}/tasks_${ts}.csv"
+  fi
+}
+
+# Restore tasks.csv from the latest S3 backup
+s3_restore() {
+  if ! aws_available; then
+    error_msg "AWS CLI or S3_BUCKET not configured. Cannot restore."
+    return 1
+  fi
+
+  info "Fetching latest backup from S3..."
+
+  local latest_key
+  latest_key=$(aws s3 ls "s3://${S3_BUCKET}/backups/" \
+    --region "${AWS_REGION}" \
+    --no-cli-pager 2>/dev/null \
+    | sort | tail -1 | awk '{print $4}')
+
+  if [[ -z "${latest_key}" ]]; then
+    error_msg "No backups found in s3://${S3_BUCKET}/backups/"
+    return 1
+  fi
+
+  # Make a local safety copy before overwriting
+  cp "${TASKS_FILE}" "${BACKUP_DIR}/tasks_pre_restore_$(date +%s).csv"
+
+  if aws s3 cp "s3://${S3_BUCKET}/backups/${latest_key}" "${TASKS_FILE}" \
+      --region "${AWS_REGION}" \
+      --no-cli-pager 2>/dev/null; then
+    success "Restored from: ${latest_key}"
+    log "INFO" "S3 restore completed: ${latest_key}"
+  else
+    die "Restore failed. Pre-restore backup saved in ${BACKUP_DIR}"
+  fi
+}
+
+# Send SNS alert for high-priority tasks
+sns_notify() {
+  local subject="$1"
+  local message="$2"
+
+  if sns_available; then
+    aws sns publish \
+      --topic-arn  "${SNS_TOPIC_ARN}" \
+      --subject    "${subject}" \
+      --message    "${message}" \
+      --region     "${AWS_REGION}" \
+      --no-cli-pager 2>/dev/null &   # Non-blocking
+    log "INFO" "SNS notification sent: ${subject}"
+  fi
+}
+
+# setup awscli and resources
+aws_setup(){
+  echo "Automatic AWS setup incoming."
+}
+
 # =============================================================================
 #  TASK CRUD — Core business logic
 # =============================================================================
@@ -333,12 +461,34 @@ add_task() {
 
   blank
   success "Task #${id} created — '${description}'"
-  log "INFO" "Task added — ID:${id} | Desc:${description} | Priority:${priority} | Due:${due_date}"
+  log "CREATED" "Task added — ID:${id} | Desc:${description} | Priority:${priority} | Due:${due_date}"
 
-  # TODO: Send SNS alert for HIGH priority tasks
+  # Send SNS alert for HIGH priority tasks
+  if [[ "${priority}" == "HIGH" ]]; then
+    message=$(cat <<EOF
+Hi Team,
 
-  # TODO: Auto-backup after every add
-  # s3_backup
+High Piority Task alert.
+
+Task ID:  #${id}
+Project Name: ${name}
+Description: ${description}
+Due Date: ${due_date}
+Category: ${category}
+
+Regards,
+CloudTask Team.
+EOF
+)
+
+    sns_notify \
+      "[CloudTask] HIGH Priority Task Created" \
+      "$message"
+    info "Alert sent for HIGH priority task."
+  fi
+
+  # Auto-backup after every add
+  s3_backup
 
   _press_enter
 }
@@ -367,7 +517,7 @@ list_tasks() {
 
   blank
   # Table header
-  printf "  ${BOLD_CYAN}%-5s  %-12s %-28s %-12s %-8s %-12s %-10s${RESET}\n" \
+  printf "  ${BOLD_CYAN}%-5s  %-20s  %-35s  %-12s  %-8s  %-12s  %-12s${RESET}\n" \
     "ID" "NAME" "DESCRIPTION" "CATEGORY" "PRIORITY" "DUE DATE" "STATUS"
   print_line
 
@@ -415,8 +565,14 @@ list_tasks() {
     local short_desc="${desc:0:26}"
     [[ "${#desc}" -gt 26 ]] && short_desc="${short_desc}.."
 
-    printf "  %-5s %-14s %-28s %-12s %-16b %-12s %-18b\n" \
-      "${id}" "${name}" "${short_desc}" "${cat:0:12}" "${pri_label}" "${due}" "${status_label}"
+    printf "  %-5s  %-20s  %-35s  %-12s  %-8s  %-12s  %-12s\n" \
+    "${id}" \
+    "${name:0:20}" \
+    "${short_desc:0:35}" \
+    "${cat:0:12}" \
+    "${pri_label}" \
+    "${due}" \
+    "${status_label}"
 
     shown=$((shown + 1))
     line_count=$((line_count + 1))
@@ -473,9 +629,9 @@ mark_complete() {
 
   # Update status and set CompletedAt timestamp
   local now; now=$(date '+%Y-%m-%d %H:%M')
-  # Using awk to safely update specific columns (6=Status, 8=UpdatedAt, 9=CompletedAt)
+  # Using awk to safely update specific columns (7=Status, 9=UpdatedAt, 10=CompletedAt)
   awk -F',' -v id="${id}" -v now="${now}" 'BEGIN{OFS=","} {
-    if ($1 == id) { $6="COMPLETED"; $8=now; $9=now }
+    if ($1 == id) { $7="COMPLETED"; $9=now; $10=now }
     print
   }' "${TASKS_FILE}" > "${TASKS_FILE}.tmp" && mv "${TASKS_FILE}.tmp" "${TASKS_FILE}"
 
@@ -483,7 +639,7 @@ mark_complete() {
   success "Task #${id} marked as COMPLETE."
   log "INFO" "Task completed — ID:${id}"
   
-  # TODO: s3_backup
+  s3_backup
 
   _press_enter
 }
@@ -511,16 +667,20 @@ update_task() {
   local current_line
   current_line=$(grep "^${id}," "${TASKS_FILE}")
 
-  local cur_desc cur_cat cur_pri cur_due
-  cur_desc=$(echo "${current_line}" | cut -d',' -f2)
-  cur_cat=$(echo  "${current_line}" | cut -d',' -f3)
-  cur_pri=$(echo  "${current_line}" | cut -d',' -f4)
-  cur_due=$(echo  "${current_line}" | cut -d',' -f5)
+  local cur_name cur_desc cur_cat cur_pri cur_due
+  cur_name=$(echo "${current_line}" | cut -d',' -f2)
+  cur_desc=$(echo "${current_line}" | cut -d',' -f3)
+  cur_cat=$(echo  "${current_line}" | cut -d',' -f4)
+  cur_pri=$(echo  "${current_line}" | cut -d',' -f5)
+  cur_due=$(echo  "${current_line}" | cut -d',' -f6)
 
   echo -e "\n  ${YELLOW}Press Enter to keep current value:${RESET}\n"
 
   # Prompt with existing values as defaults
-  local new_desc new_cat new_pri new_due
+  local new_name new_desc new_cat new_pri new_due
+
+  read -rp "  Name  [${cur_desc}]: " new_name
+  new_name="${new_name:-${cur_name}}"
 
   read -rp "  Description  [${cur_desc}]: " new_desc
   new_desc="${new_desc:-${cur_desc}}"
@@ -546,18 +706,18 @@ update_task() {
   local now; now=$(date '+%Y-%m-%d %H:%M')
 
   # awk updates columns safely without breaking other fields
-  awk -F',' -v id="${id}" -v d="${new_desc}" -v c="${new_cat}" \
+  awk -F',' -v id="${id}" -v n="${new_name}"  -v d="${new_desc}" -v c="${new_cat}" \
       -v p="${new_pri}" -v due="${new_due}" -v now="${now}" \
       'BEGIN{OFS=","} {
-        if ($1 == id) { $2=d; $3=c; $4=p; $5=due; $8=now }
+        if ($1 == id) { $2=n; $3=d; $4=c; $5=p;  $6=due; $9=now }
         print
       }' "${TASKS_FILE}" > "${TASKS_FILE}.tmp" && mv "${TASKS_FILE}.tmp" "${TASKS_FILE}"
 
   blank
   success "Task #${id} updated."
-  log "INFO" "Task updated — ID:${id} | Desc:${new_desc} | Pri:${new_pri} | Due:${new_due}"
+  log "UPDATE" "Task updated — ID:${id} | Name:${new_name} | Desc:${new_desc} | Pri:${new_pri} | Due:${new_due}"
   
-  # TODO: s3_backup
+  s3_backup
 
   _press_enter
 }
@@ -607,11 +767,263 @@ delete_task() {
 
   blank
   success "Task #${id} ('${desc}') deleted."
-  log "INFO" "Task deleted — ID:${id} | Desc:${desc}"
+  log "DELETE" "Task deleted — ID:${id} | Desc:${desc}"
   
-  # TODO: s3_backup
+  s3_backup
 
   _press_enter
+}
+
+
+# ── SEARCH ────────────────────────────────────────────────────────────────────
+search_tasks() {
+  clear
+  print_dline
+  echo -e "  ${BOLD_BLUE}  SEARCH TASKS${RESET}"
+  print_dline
+  blank
+
+  read -rp "  Enter search term: " term
+
+  if [[ -z "${term}" ]]; then
+    error_msg "Search term cannot be empty."
+    _press_enter; return
+  fi
+
+  blank
+  info "Results for: '${term}'"
+  print_line
+  printf "  ${BOLD_CYAN}%-5s %-30s %-12s %-8s %-12s %-10s${RESET}\n" \
+    "ID" "DESCRIPTION" "CATEGORY" "PRIORITY" "DUE DATE" "STATUS"
+  print_line
+
+  local found=0
+  while IFS=',' read -r id desc cat pri due status rest; do
+    [[ "${id}" == "ID" ]] && continue
+    # Case-insensitive search across description and category
+    if echo "${desc} ${cat}" | grep -qi "${term}"; then
+      printf "  %-5s %-30s %-12s %-8s %-12s %-10s\n" \
+        "${id}" "${desc:0:28}" "${cat:0:12}" "${pri}" "${due}" "${status}"
+      found=$((found + 1))
+    fi
+  done < "${TASKS_FILE}"
+
+  print_line
+  echo -e "  ${DIM}${found} result(s) found${RESET}"
+  log "INFO" "Search performed — term:'${term}' | results:${found}"
+  _press_enter
+}
+
+# ── STATISTICS ────────────────────────────────────────────────────────────────
+show_stats() {
+  clear
+  print_dline
+  echo -e "  ${BOLD_BLUE}  STATISTICS & REPORTS${RESET}"
+  print_dline
+  blank
+
+  local total pending completed high medium low overdue
+  total=$(tail -n +2 "${TASKS_FILE}" | wc -l)
+  pending=$(grep -c ",PENDING," "${TASKS_FILE}" 2>/dev/null || echo 0)
+  completed=$(grep -c ",COMPLETED," "${TASKS_FILE}" 2>/dev/null || echo 0)
+  high=$(grep -c ",HIGH," "${TASKS_FILE}" 2>/dev/null || echo 0)
+  medium=$(grep -c ",MEDIUM," "${TASKS_FILE}" 2>/dev/null || echo 0)
+  low=$(grep -c ",LOW," "${TASKS_FILE}" 2>/dev/null || echo 0)
+
+  # Count overdue: PENDING tasks with due date before today
+  overdue=0
+  while IFS=',' read -r id desc cat pri due status rest; do
+    [[ "${id}" == "ID" ]] && continue
+    [[ "${status}" != "PENDING" ]] && continue
+    if [[ -n "${due}" ]] && [[ "$(date -d "${due}" +%s 2>/dev/null)" -lt "$(date +%s)" ]]; then
+      overdue=$((overdue + 1))
+    fi
+  done < "${TASKS_FILE}"
+
+  # Completion rate
+  local rate=0
+  [[ "${total}" -gt 0 ]] && rate=$(( completed * 100 / total ))
+
+  echo -e "  ${BOLD_CYAN}  OVERVIEW${RESET}"
+  printf "  %-25s %s\n" "Total Tasks:"     "${total}"
+  printf "  %-25s ${GREEN}%s${RESET}\n"    "Completed:"       "${completed}"
+  printf "  %-25s ${YELLOW}%s${RESET}\n"   "Pending:"         "${pending}"
+  printf "  %-25s ${RED}%s${RESET}\n"      "Overdue:"         "${overdue}"
+  printf "  %-25s %s%%\n"                  "Completion Rate:" "${rate}"
+  blank
+
+  echo -e "  ${BOLD_CYAN}  BY PRIORITY${RESET}"
+  printf "  %-25s ${BOLD_RED}%s${RESET}\n"    "High:"   "${high}"
+  printf "  %-25s ${YELLOW}%s${RESET}\n"      "Medium:" "${medium}"
+  printf "  %-25s ${GREEN}%s${RESET}\n"       "Low:"    "${low}"
+  blank
+
+  # Visual completion bar
+  local bar_filled=$(( rate / 5 ))
+  local bar_empty=$(( 20 - bar_filled ))
+  local bar=""
+  for ((i=0; i<bar_filled; i++)); do bar="${bar}█"; done
+  for ((i=0; i<bar_empty;  i++)); do bar="${bar}░"; done
+  echo -e "  ${BOLD_CYAN}  PROGRESS${RESET}"
+  echo -e "  ${GREEN}${bar}${RESET}  ${rate}%"
+  blank
+
+  log "INFO" "Statistics viewed — total:${total} | completed:${completed} | pending:${pending}"
+  _press_enter
+}
+
+
+# ── FILTER MENU ───────────────────────────────────────────────────────────────
+filter_menu() {
+  clear
+  print_dline
+  echo -e "  ${BOLD_BLUE}  FILTER TASKS${RESET}"
+  print_dline
+  blank
+  echo "  1. Filter by Category"
+  echo "  2. Filter by Priority"
+  echo "  3. Filter by Status"
+  echo "  4. Show Overdue Tasks"
+  blank
+  read -rp "  Choose filter [1-4]: " choice
+
+  case "${choice}" in
+    1)
+      read -rp "  Category name: " val
+      list_tasks "category" "${val}"
+      ;;
+    2)
+      read -rp "  Priority [HIGH/MEDIUM/LOW]: " val
+      list_tasks "priority" "${val}"
+      ;;
+    3)
+      read -rp "  Status [PENDING/COMPLETED]: " val
+      list_tasks "status" "${val}"
+      ;;
+    4)
+      # Show only overdue pending tasks
+      clear
+      print_dline
+      echo -e "  ${BOLD_RED}  OVERDUE TASKS${RESET}"
+      print_dline
+      blank
+      printf "  ${BOLD_CYAN}%-5s %-28s %-12s %-8s %-12s${RESET}\n" \
+        "ID" "DESCRIPTION" "CATEGORY" "PRIORITY" "DUE DATE"
+      print_line
+      local found=0
+      while IFS=',' read -r id desc cat pri due status rest; do
+        [[ "${id}" == "ID" ]] && continue
+        [[ "${status}" != "PENDING" ]] && continue
+        if [[ -n "${due}" ]] && [[ "$(date -d "${due}" +%s 2>/dev/null)" -lt "$(date +%s)" ]]; then
+          printf "  ${RED}%-5s %-28s %-12s %-8s %-12s${RESET}\n" \
+            "${id}" "${desc:0:26}" "${cat:0:12}" "${pri}" "${due}"
+          found=$((found + 1))
+        fi
+      done < "${TASKS_FILE}"
+      print_line
+      echo -e "  ${DIM}${found} overdue task(s)${RESET}"
+      _press_enter
+      ;;
+    *)
+      error_msg "Invalid option."
+      _press_enter
+      ;;
+  esac
+}
+
+
+# ── EXPORT ────────────────────────────────────────────────────────────────────
+export_tasks() {
+  clear
+  print_dline
+  echo -e "  ${BOLD_BLUE}  EXPORT TASKS${RESET}"
+  print_dline
+  blank
+
+  echo -e "  ${CYAN}Export format:${RESET}"
+  echo "  1. CSV  (tasks_export_DATE.csv)"
+  echo "  2. TXT  (plain text table)"
+  blank
+  read -rp "  Choose format [1/2]: " fmt
+
+  local ts; ts=$(date '+%Y%m%d_%H%M%S')
+
+  case "${fmt}" in
+    1)
+      local csv_out="${DATA_DIR}/tasks_export_${ts}.csv"
+      cp "${TASKS_FILE}" "${csv_out}"
+      success "Exported to: ${csv_out}"
+      log "INFO" "Tasks exported to CSV: ${csv_out}"
+
+      # Optionally push to S3
+      if aws_available; then
+        read -rp "  Upload export to S3? [y/N]: " upload
+        if [[ "${upload,,}" == "y" ]]; then
+          aws s3 cp "${csv_out}" \
+            "s3://${S3_BUCKET}/exports/tasks_export_${ts}.csv" \
+            --region "${AWS_REGION}" \
+            --no-cli-pager && \
+            success "Uploaded to s3://${S3_BUCKET}/exports/"
+        fi
+      fi
+      ;;
+    2)
+      local txt_out="${DATA_DIR}/tasks_export_${ts}.txt"
+      {
+        printf "%-5s %-30s %-12s %-8s %-12s %-10s\n" \
+          "ID" "DESCRIPTION" "CATEGORY" "PRIORITY" "DUE DATE" "STATUS"
+        printf '%.0s─' {1..80}; echo
+        while IFS=',' read -r id desc cat pri due status rest; do
+          [[ "${id}" == "ID" ]] && continue
+          printf "%-5s %-30s %-12s %-8s %-12s %-10s\n" \
+            "${id}" "${desc:0:28}" "${cat:0:12}" "${pri}" "${due}" "${status}"
+        done < "${TASKS_FILE}"
+      } > "${txt_out}"
+      success "Exported to: ${txt_out}"
+      log "INFO" "Tasks exported to TXT: ${txt_out}"
+      ;;
+    *)
+      error_msg "Invalid selection."
+      ;;
+  esac
+  _press_enter
+}
+
+
+# ── CLOUD MENU ────────────────────────────────────────────────────────────────
+cloud_menu() {
+  clear
+  print_dline
+  echo -e "  ${BOLD_BLUE}  AWS CLOUD OPERATIONS${RESET}"
+  print_dline
+  blank
+  echo "  1. Back up tasks to S3 now"
+  echo "  2. Restore tasks from S3"
+  echo "  3. Set up AWS resources: S3, SNS, CloudWatch (required)"
+  echo "  4. View AWS configuration"
+  blank
+  read -rp "  Choose [1-3]: " choice
+
+  case "${choice}" in
+    1) s3_backup;  _press_enter ;;
+    2)
+      warn "This will OVERWRITE your local tasks with the S3 backup."
+      read -rp "  Proceed? [yes/NO]: " confirm
+      [[ "${confirm}" == "yes" ]] && s3_restore
+      _press_enter
+      ;;
+    3) aws_setup; _press_enter ;;
+    4)
+      blank
+      echo -e "  ${CYAN}AWS Region   :${RESET} ${AWS_REGION:-not set}"
+      echo -e "  ${CYAN}S3 Bucket    :${RESET} ${S3_BUCKET:-not set}"
+      echo -e "  ${CYAN}SNS Topic    :${RESET} ${SNS_TOPIC_ARN:-not set}"
+      echo -e "  ${CYAN}CW Log Group :${RESET} ${CW_LOG_GROUP:-not set}"
+      echo -e "  ${CYAN}AWS CLI      :${RESET} $(command -v aws 2>/dev/null || echo 'not installed')"
+      _press_enter
+      ;;
+    *) error_msg "Invalid option."; _press_enter ;;
+  esac
 }
 
 
@@ -624,7 +1036,7 @@ main_menu() {
   print_dline
   echo -e "${BOLD_CYAN}"
   echo "                      ╔══════════════════════════════════════════╗"
-  echo "                      ║            CloudTask Pro  ${APP_VERSION}          ║"
+  echo "                      ║            CloudTask ${APP_VERSION}          ║"
   echo "                      ║    AWS-Integrated Terminal Task Manager  ║"
   echo "                      ╚══════════════════════════════════════════╝"
   echo -e "${RESET}"
@@ -632,7 +1044,10 @@ main_menu() {
 
   # Show pending and overdue count at-a-glance
   local pending; pending=$(grep -c ",PENDING," "${TASKS_FILE}" 2>/dev/null || echo 0)
-  echo -e "  ${DIM}Pending tasks: ${YELLOW}${pending}${RESET}"
+  local completed; completed=$(grep -c ",COMPLETED," "${TASKS_FILE}" 2>/dev/null || echo 0)
+
+  echo -e "  ${DIM}Pending: ${YELLOW}${pending}${RESET}  |  ${DIM}Completed: ${GREEN}${completed}${RESET}"
+
   blank
 
   echo -e "  ${BOLD_CYAN}TASK MANAGEMENT${RESET}"

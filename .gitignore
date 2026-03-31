@@ -10,7 +10,7 @@
 Vagrantfile
 *.box
 
-demo.sh
+aws_setup.sh
 
 # AWS credentials — never commit
 .env
